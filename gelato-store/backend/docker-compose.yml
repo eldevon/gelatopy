@@ -1,67 +1,234 @@
+# version: '3.8'
+
+# services:
+#   postgres-product:
+#     image: postgres:15
+#     environment:
+#       POSTGRES_DB: product_db
+#       POSTGRES_USER: gelato_user
+#       POSTGRES_PASSWORD: gelato_pass
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - product_data:/var/lib/postgresql/data
+
+#   postgres-order:
+#     image: postgres:15
+#     environment:
+#       POSTGRES_DB: order_db
+#       POSTGRES_USER: gelato_user
+#       POSTGRES_PASSWORD: gelato_pass
+#     ports:
+#       - "5433:5432"
+#     volumes:
+#       - order_data:/var/lib/postgresql/data
+
+#   rabbitmq:
+#     image: rabbitmq:3-management
+#     ports:
+#       - "5672:5672"
+#       - "15672:15672"
+#     environment:
+#       RABBITMQ_DEFAULT_USER: guest
+#       RABBITMQ_DEFAULT_PASS: guest
+
+#   product-service:
+#     build: ./product-service
+#     ports:
+#       - "8001:8001"
+#     environment:
+#       DATABASE_URL: postgresql://gelato_user:gelato_pass@postgres-product:5432/product_db
+#       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+#     depends_on:
+#       - postgres-product
+#       - rabbitmq
+
+#   order-service:
+#     build: ./order-service
+#     ports:
+#       - "8002:8002"
+#     environment:
+#       DATABASE_URL: postgresql://gelato_user:gelato_pass@postgres-order:5432/order_db
+#       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+#     depends_on:
+#       - postgres-order
+#       - rabbitmq
+
+#   api-gateway:
+#     build: ./api-gateway
+#     ports:
+#       - "8000:8000"
+#     depends_on:
+#       - product-service
+#       - order-service
+
+# volumes:
+#   product_data:
+#   order_data:
+
 version: '3.8'
 
 services:
+  # PostgreSQL for Product Service
   postgres-product:
-    image: postgres:15
+    image: postgres:15-alpine
+    container_name: gelato-product-db
     environment:
       POSTGRES_DB: product_db
       POSTGRES_USER: gelato_user
       POSTGRES_PASSWORD: gelato_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     volumes:
-      - product_data:/var/lib/postgresql/data
+      - postgres_product_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - gelato-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gelato_user -d product_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
+  # PostgreSQL for Order Service
   postgres-order:
-    image: postgres:15
+    image: postgres:15-alpine
+    container_name: gelato-order-db
     environment:
       POSTGRES_DB: order_db
       POSTGRES_USER: gelato_user
       POSTGRES_PASSWORD: gelato_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5433:5432"
     volumes:
-      - order_data:/var/lib/postgresql/data
+      - postgres_order_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - gelato-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gelato_user -d order_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
+  # RabbitMQ for message broker
   rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    image: rabbitmq:3.12-management-alpine
+    container_name: gelato-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-
-  product-service:
-    build: ./product-service
+      RABBITMQ_DEFAULT_VHOST: /
     ports:
-      - "8001:8001"
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - gelato-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Product Service
+  product-service:
+    build:
+      context: ./product-service
+      dockerfile: Dockerfile
+    container_name: gelato-product-service
     environment:
       DATABASE_URL: postgresql://gelato_user:gelato_pass@postgres-product:5432/product_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-    depends_on:
-      - postgres-product
-      - rabbitmq
-
-  order-service:
-    build: ./order-service
+      SERVICE_NAME: product-service
+      ENVIRONMENT: development
     ports:
-      - "8002:8002"
+      - "8001:8001"
+    volumes:
+      - ./product-service:/app
+      - ./shared:/app/shared
+      - /app/__pycache__
+    depends_on:
+      postgres-product:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - gelato-network
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  # Order Service
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: gelato-order-service
     environment:
       DATABASE_URL: postgresql://gelato_user:gelato_pass@postgres-order:5432/order_db
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      SERVICE_NAME: order-service
+      ENVIRONMENT: development
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./order-service:/app
+      - ./shared:/app/shared
+      - /app/__pycache__
     depends_on:
-      - postgres-order
-      - rabbitmq
+      postgres-order:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - gelato-network
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
 
+  # API Gateway
   api-gateway:
-    build: ./api-gateway
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: gelato-api-gateway
+    environment:
+      PRODUCT_SERVICE_URL: http://product-service:8001
+      ORDER_SERVICE_URL: http://order-service:8002
+      SERVICE_NAME: api-gateway
+      ENVIRONMENT: development
     ports:
       - "8000:8000"
+    volumes:
+      - ./api-gateway:/app
+      - ./shared:/app/shared
+      - /app/__pycache__
     depends_on:
-      - product-service
-      - order-service
+      product-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+    networks:
+      - gelato-network
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
+# Networks
+networks:
+  gelato-network:
+    driver: bridge
+    name: gelato-network
+
+# Volumes for persistent data
 volumes:
-  product_data:
-  order_data:
+  postgres_product_data:
+    name: gelato-postgres-product-data
+  postgres_order_data:
+    name: gelato-postgres-order-data
+  rabbitmq_data:
+    name: gelato-rabbitmq-data
